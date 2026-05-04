@@ -23,3 +23,11 @@ prev_year_qtr <- function(year_qtr) {
   qtr <- as.integer(substr(year_qtr, 5, 5))
   if (qtr == 1) paste0(yr - 1L, 4L) else paste0(yr, qtr - 1L)
 }
+
+quarter_diff <- function(date1, date2) {
+  get_q_index <- function(d) {
+    (year(d) * 4) + ((month(d) - 1) %/% 3)
+  }
+  
+  abs(get_q_index(date2) - get_q_index(date1))
+}

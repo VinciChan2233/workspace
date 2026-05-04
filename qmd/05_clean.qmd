@@ -402,7 +402,7 @@ detect_unit_switches <- function(holdext_raw) {
 
 ### 2.2.6. Missing quarters
 
-We build a complete cik-quarter panel with LOCF (last observation carried forward).
+We build a complete cik-quarter panel with LOCF (last observation carried forward). However, only missing quarters between min_rquarter and max_rquarter will be filled. This keeps the data smooth while staying succinct. 
 
 ```{r}
 build_missing_quarters_batch <- function(batch_ds) {
