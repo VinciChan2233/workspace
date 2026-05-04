@@ -49,8 +49,11 @@ The pipeline is designed to turn raw 13F filings into structured, analysis-ready
 
 8. **Analyze**
    - Construct manager-quarter portfolio summaries
-   - Compute simple return and holdings-based metrics
-   - Explore cross-sectional fund characteristics
+   - Compute quarterly returns and risk-adjusted performance metrics
+   - Identify top performers by Sharpe ratio across multiple time horizons (2-5 years)
+   - Calculate portfolio similarity using cosine distance on holdings weights
+   - Backtest paired fund performance
+   - Explore relationship between portfolio similarity and risk-adjusted returns
 
 ## Repository Structure
 
@@ -88,6 +91,7 @@ utils_dates.R                    # Quarter table and date utilities
 - Parquet outputs for efficient downstream analysis
 - Built-in QA summaries and validation plots
 - Modular workflow split into reproducible Quarto scripts
+- Manager-level performance analysis and portfolio similarity metrics
 
 ## Data Workflow
 
