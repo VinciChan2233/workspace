@@ -52,7 +52,7 @@ calculate_fund_returns <- function(holdings_data) {
     ungroup()
 }
 
-get_top_performers <- function(returns_data, horizon_quarters, latest_qtr, n_top) {
+score_funds_by_horizon <- function(returns_data, horizon_quarters, latest_qtr) {
   returns_data %>%
     filter(!is.na(quarterly_return)) %>%
     mutate(quarters_ago = quarter_diff(rquarter, latest_qtr)) %>%
@@ -65,22 +65,52 @@ get_top_performers <- function(returns_data, horizon_quarters, latest_qtr, n_top
       sd_return = sd(quarterly_return),
       sharpe_ratio = if_else(sd_return == 0, NA_real_, mean_return / sd_return),
       .groups = "drop"
+    )
+}
+
+assign_size_buckets <- function(returns_data, latest_qtr, n_buckets = 4) {
+  returns_data %>%
+    filter(rquarter == latest_qtr) %>%
+    distinct(cik, total_value) %>%
+    mutate(
+      size_bucket = ntile(total_value, n_buckets),
+      size_bucket = paste0("Q", size_bucket)
     ) %>%
-    arrange(desc(sharpe_ratio)) %>%
-    slice_head(n = n_top)
+    select(cik, total_value, size_bucket)
+}
+
+select_cohort_funds <- function(scored_funds, n_select = 10) {
+  top_tbl <- scored_funds %>%
+    arrange(desc(sharpe_ratio), cik) %>%
+    slice_head(n = n_select) %>%
+    mutate(cohort = "top")
+
+  bottom_tbl <- scored_funds %>%
+    arrange(sharpe_ratio, cik) %>%
+    slice_head(n = n_select) %>%
+    mutate(cohort = "bottom")
+
+  mid_start <- floor((nrow(scored_funds) - n_select) / 2) + 1
+
+  middle_tbl <- scored_funds %>%
+    arrange(sharpe_ratio, cik) %>%
+    slice(mid_start:(mid_start + n_select - 1)) %>%
+    mutate(cohort = "middle")
+
+  bind_rows(top_tbl, bottom_tbl, middle_tbl)
 }
 ```
 
 ## 3.2. Portfolio Similarity
 
 ```{r}
-get_holdings_at_period_start <- function(holdings_data, top_performers_tbl) {
+get_holdings_at_period_start <- function(holdings_data, selected_funds_tbl) {
   holdings_data %>%
     to_duckdb() %>%
     select(cik, rquarter, cusip, value) %>%
     inner_join(
-      top_performers_tbl %>%
-        select(horizon_years, start_date, cik),
+      selected_funds_tbl %>%
+        select(horizon_years, start_date, size_bucket, cohort, cik),
       join_by(cik, rquarter == start_date),
       copy = TRUE
     ) %>%
@@ -89,14 +119,14 @@ get_holdings_at_period_start <- function(holdings_data, top_performers_tbl) {
 
 compute_portfolio_weights <- function(holdings_data) {
   holdings_data %>%
-    group_by(horizon_years, cik) %>%
+    group_by(horizon_years, size_bucket, cohort, cik) %>%
     mutate(
       total_value = sum(value, na.rm = TRUE),
       value_weight = value / total_value
     ) %>%
-    select(horizon_years, cik, cusip, value_weight) %>%
+    select(horizon_years, size_bucket, cohort, cik, cusip, value_weight) %>%
     ungroup() %>%
-    group_by(horizon_years, cik, cusip) %>%
+    group_by(horizon_years, size_bucket, cohort, cik, cusip) %>%
     summarise(
       value_weight = sum(value_weight, na.rm = TRUE),
       .groups = "drop"
@@ -105,20 +135,22 @@ compute_portfolio_weights <- function(holdings_data) {
 
 portfolio_vectors_to_matrices <- function(portfolio_vectors) {
   portfolio_vectors %>%
-    pivot_wider(
-      names_from = cusip,
-      values_from = value_weight,
-      values_fill = 0
+    group_by(horizon_years, size_bucket, cohort) %>%
+    nest() %>%
+    mutate(
+      sim_input = map(data, ~ .x %>%
+        pivot_wider(
+          names_from = cusip,
+          values_from = value_weight,
+          values_fill = 0
+        )),
+      sim_matrix = map(sim_input, ~ {
+        mat <- .x %>% select(-cik) %>% as.matrix()
+        rownames(mat) <- .x$cik
+        mat
+      })
     ) %>%
-    group_split(horizon_years) %>%
-    set_names(unique(portfolio_vectors$horizon_years)) %>%
-    map(~ {
-      mat <- .x %>%
-        select(-horizon_years, -cik) %>%
-        as.matrix()
-      rownames(mat) <- .x$cik
-      mat
-    })
+    select(horizon_years, size_bucket, cohort, sim_matrix)
 }
 
 cosine_similarity_from_matrix <- function(M) {
@@ -156,38 +188,47 @@ extract_unique_pairs <- function(sim_matrix) {
     )
 }
 
-get_extreme_pairs <- function(sim_matrix, horizon_label) {
-  # Extract most similar and least similar fund pairs for a given horizon
-  unique_pairs <- extract_unique_pairs(sim_matrix)
-
-  most_similar <- unique_pairs %>%
-    arrange(desc(cos_sim)) %>%
-    slice_head(n = 1)
-
-  least_similar <- unique_pairs %>%
-    arrange(cos_sim) %>%
-    slice_head(n = 1)
-
-  bind_rows(
-    most_similar %>% mutate(horizon = horizon_label, type = "most"),
-    least_similar %>% mutate(horizon = horizon_label, type = "least")
-  ) %>%
-    select(fund_1, fund_2, cos_sim, horizon, type)
+get_extreme_pairs_by_cohort <- function(cosine_sims, time_horizons) {
+  cosine_sims %>%
+    mutate(
+      pair_tbl = map(sim_matrix, ~ {
+        pairs <- extract_unique_pairs(.x)
+        most_similar <- pairs %>%
+          arrange(desc(cos_sim)) %>%
+          slice_head(n = 1) %>%
+          mutate(type = "most")
+        least_similar <- pairs %>%
+          arrange(cos_sim) %>%
+          slice_head(n = 1) %>%
+          mutate(type = "least")
+        bind_rows(most_similar, least_similar)
+      })
+    ) %>%
+    select(horizon_years, size_bucket, cohort, pair_tbl) %>%
+    unnest(pair_tbl) %>%
+    rename(horizon = horizon_years) %>%
+    left_join(
+      time_horizons %>%
+        select(horizon_years, start_date),
+      by = c("horizon" = "horizon_years")
+    )
 }
 ```
 
 ## 3.3. Backtest and Performance
 
 ```{r}
+prepare_extreme_pairs <- function(cosine_sims, time_horizons) {
+  get_extreme_pairs_by_cohort(cosine_sims, time_horizons)
+}
+
 get_pair_holdings_over_time <- function(holdings_data, pairs_table) {
-  # Expand pairs into individual funds and get all their holdings post-start_date
   pairs_table %>%
     pivot_longer(
       cols = c(fund_1, fund_2),
-      names_to = NULL,
+      names_to = "fund_slot",
       values_to = "fund"
     ) %>%
-    select(fund, everything()) %>%
     left_join(
       holdings_data %>%
         to_duckdb() %>%
@@ -201,36 +242,49 @@ get_pair_holdings_over_time <- function(holdings_data, pairs_table) {
 }
 
 calculate_backtest_returns <- function(backtest_holdings) {
-  # Aggregate holdings by horizon/type/quarter and compute quarterly returns
   backtest_holdings %>%
-    group_by(horizon, type, rquarter) %>%
+    # 1) Combine the two funds into one pair portfolio per quarter
+    group_by(
+      horizon, size_bucket, cohort, type,
+      pair_key, rquarter
+    ) %>%
     summarise(
-      total_value = sum(value, na.rm = TRUE),
-      n_holdings = n(),
+      total_value_pair = sum(value, na.rm = TRUE),
+      n_holdings_pair  = n(),
       .groups = "drop"
     ) %>%
-    arrange(horizon, type, rquarter) %>%
-    group_by(horizon, type) %>%
+    # 2) Order over time within each pair
+    arrange(
+      horizon, size_bucket, cohort, type,
+      pair_key, rquarter
+    ) %>%
+    # 3) Compute time-series returns at the pair level
+    group_by(
+      horizon, size_bucket, cohort, type,
+      pair_key
+    ) %>%
     mutate(
-      prev_value = lag(total_value),
-      quarterly_return = (total_value - prev_value) / prev_value
+      prev_value_pair   = lag(total_value_pair),
+      quarterly_return  = (total_value_pair - prev_value_pair) / prev_value_pair
     ) %>%
     ungroup()
 }
 
 compute_backtest_statistics <- function(backtest_returns) {
-  # Compute performance metrics for each horizon/type combination
   backtest_returns %>%
     filter(!is.na(quarterly_return)) %>%
-    group_by(horizon, type) %>%
+    group_by(
+      horizon, size_bucket, cohort, type,
+      pair_key
+    ) %>%
     summarise(
-      n_period = n(),
-      mean_return = mean(quarterly_return),
-      sd_return = sd(quarterly_return),
+      n_period     = n(),
+      mean_return  = mean(quarterly_return),
+      sd_return    = sd(quarterly_return),
       sharpe_ratio = if_else(sd_return == 0, NA_real_, mean_return / sd_return),
       .groups = "drop"
     ) %>%
-    arrange(horizon, desc(sharpe_ratio))
+    arrange(horizon, size_bucket, cohort, type, desc(sharpe_ratio))
 }
 ```
 
@@ -244,7 +298,8 @@ returns_by_fund <- calculate_fund_returns(holdext_clean)
 
 # Define time horizons and identify top performers
 latest_rquarter <- max(returns_by_fund$rquarter)
-n_top <- 10
+n_select <- 10
+n_buckets <- 4
 
 time_horizons <- tribble(
   ~horizon_years,
@@ -257,55 +312,70 @@ time_horizons <- tribble(
     quarters_back = horizon_years * 4,
     start_date = latest_rquarter - months(quarters_back * 3)
   )
+time_horizons
 
-top_performers <- time_horizons %>%
+fund_sizes <- assign_size_buckets(
+  returns_data = returns_by_fund,
+  latest_qtr = latest_rquarter,
+  n_buckets = n_buckets
+)
+fund_sizes
+
+fund_cohorts <- time_horizons %>%
   mutate(
-    top_funds = map(
+    scored_funds = map(
       quarters_back,
-      ~ get_top_performers(returns_by_fund, .x, latest_rquarter, n_top)
+      ~ score_funds_by_horizon(returns_by_fund, .x, latest_rquarter)
     )
   ) %>%
-  unnest(top_funds) %>%
-  select(-quarters_back)
+  select(horizon_years, start_date, scored_funds) %>%
+  unnest(scored_funds) %>%
+  inner_join(fund_sizes, by = "cik") %>%
+  group_by(horizon_years, start_date, size_bucket) %>%
+  group_modify(~ select_cohort_funds(.x, n_select = n_select)) %>%
+  ungroup()
+
+time_horizons %>%
+  mutate(
+    scored_funds = map(
+      quarters_back,
+      ~ score_funds_by_horizon(returns_by_fund, .x, latest_rquarter)
+    )
+  )
+fund_cohorts %>% glimpse()
 ```
 
 ## 4.2. Portfolio Similarity
 
 ```{r}
 # Get holdings at start of each time horizon
-holdings_at_start <- get_holdings_at_period_start(holdext_clean, top_performers)
+holdings_at_start <- get_holdings_at_period_start(holdext_clean, fund_cohorts)
 
 # Compute portfolio weights
 portfolio_vectors <- compute_portfolio_weights(holdings_at_start)
+portfolio_vectors
 
-# Convert to matrices (one per horizon)
+# Convert to matrices (one per horizon × size_bucket × cohort)
 portfolio_matrices <- portfolio_vectors_to_matrices(portfolio_vectors)
+portfolio_matrices
+portfolio_matrices %>% ungroup() %>% slice(3) %>% pluck("sim_matrix") %>% glimpse() # example
 
 # Compute cosine similarities
 cosine_sims <- portfolio_matrices %>%
-  map(cosine_similarity_from_matrix)
+  mutate(sim_matrix = map(sim_matrix, cosine_similarity_from_matrix))
+cosine_sims
+cosine_sims %>% ungroup() %>% slice(3) %>% pluck("sim_matrix") # example
 
-# Extract extreme pairs
-extreme_pairs <- map2_dfr(
-  cosine_sims,
-  time_horizons$horizon_years,
-  ~ get_extreme_pairs(.x, .y)
-)
+# Extract extreme pairs per horizon/size_bucket/cohort
+extreme_pairs <- prepare_extreme_pairs(cosine_sims, time_horizons)
+extreme_pairs
 ```
 
 ## 4.3. Backtest Performance
 
 ```{r}
-# Add time horizon metadata to pairs
-pair_performance_data <- extreme_pairs %>%
-  left_join(
-    time_horizons %>%
-      select(-quarters_back),
-    join_by(horizon == horizon_years)
-  )
-
 # Get holdings for paired funds over time
-backtest_holdings <- get_pair_holdings_over_time(holdext_clean, pair_performance_data)
+backtest_holdings <- get_pair_holdings_over_time(holdext_clean, extreme_pairs)
 
 # Calculate returns
 backtest_returns <- calculate_backtest_returns(backtest_holdings)
@@ -317,4 +387,49 @@ backtest_stats
 
 # 5. Results & Interpretation
 
-Among top performers, similarity doesn't appear to be a strong predictor of risk-adjusted returns.
+```{r}
+sharpe_wide <- backtest_stats %>% 
+  select(horizon, size_bucket, cohort, type, pair_key, sharpe_ratio) %>% 
+  pivot_wider(
+    names_from = type,
+    values_from = c(sharpe_ratio, pair_key),
+    names_sep = "_"
+  ) %>% 
+  mutate(
+    sharpe_diff = sharpe_ratio_most - sharpe_ratio_least
+  )
+sharpe_wide
+
+sharpe_wide %>%
+  ggplot(aes(x = factor(horizon), y = sharpe_diff)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.alpha = 0.6) +
+  labs(
+    x = "Horizon (years)",
+    y = "Sharpe(most) - Sharpe(least)",
+    title = "Difference in Sharpe between most- and least-similar pairs\nby horizon (within size bucket and cohort)"
+  ) +
+  theme_minimal()
+
+overall <- sharpe_wide %>%
+  summarise(
+    n_cells        = n(),
+    n_most_better  = sum(sharpe_diff > 0, na.rm = TRUE),
+    n_least_better = sum(sharpe_diff < 0, na.rm = TRUE),
+    mean_diff      = mean(sharpe_diff, na.rm = TRUE),
+    median_diff    = median(sharpe_diff, na.rm = TRUE)
+  )
+overall
+
+by_horizon <- sharpe_wide %>%
+  group_by(horizon) %>%
+  summarise(
+    n_cells       = n(),
+    n_most_better = sum(sharpe_diff > 0, na.rm = TRUE),
+    mean_diff     = mean(sharpe_diff, na.rm = TRUE),
+    .groups = "drop"
+  )
+by_horizon
+```
+
+Controlling for fund size and ex-ante performance cohort, there is no strong, consistent relationship between portfolio similarity and subsequent pair-level Sharpe ratios. Across all horizon–size–cohort cells, most-similar pairs outperform in 26 of 48 cases, with an average Sharpe difference of about 0.01–0.02, which is small. The sign of the effect varies by horizon: over shorter (2-year) windows, less-similar pairs actually do slightly better, while over intermediate (3–4 year) windows, more-similar pairs tend to show somewhat higher Sharpe. Over the longest (5-year) horizon, similarity appears to have no meaningful impact.
