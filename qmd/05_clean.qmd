@@ -215,183 +215,138 @@ filter_outliers <- function(holdext_raw) {
 
 ### 2.2.5. value unit conversion
 
-Starting on January 3, 2023, market value is reported in dollars. Previously, market value was reported in thousands. [SEC Notice](https://www.sec.gov/files/form_13f_readme.pdf)
+Starting on January 3, 2023, Form 13F filers report market value in dollars; previously, market value was reported in thousands of dollars. To maintain a consistent unit over time, we convert any dollar‑reported values back to thousands. [SEC Notice](https://www.sec.gov/files/form_13f_readme.pdf)
 
-To preserve consistency over time, values reported in dollars should be converted back to thousands. However, not all filers appear to switch units at the same time, so we detect likely unit-switch episodes from manager-level quarter-on-quarter jumps in aggregate portfolio value rather than applying a blanket conversion rule.
+Rather than applying a blanket “post‑2023 = dollars” rule, we infer unit switches at the manager level using each filer’s own history:
+
+For each CIK, we build a manager–quarter panel of aggregate portfolio value and holdings count, and classify the initial reporting regime using the first filing date (first_fdate): filers whose first 13F is before 2023‑01‑03 are treated as starting in thousands; those whose first 13F is on or after that date are treated as starting in dollars.
+
+Within each manager’s panel, we compute quarter‑on‑quarter value ratios (value_ratio) and holdings ratios (holdings_ratio). We then identify at most one unit‑switch quarter per manager as the largest value spike with a large but plausible change in holdings (value_ratio > 50 and holdings_ratio < 5).
+
+The manager’s unit state is modelled as a simple two‑state process (thousands vs dollars), starting from the initial regime and flipping once at the detected switch quarter, if any. All periods in the “dollars” state are then scaled down by dividing reported values by 1,000 at the individual‑holding level.
+
+As a fallback, any manager whose aggregate portfolio value ever reaches 100 billion dollars in implied size is treated as reporting in dollars from that quarter onward, and its reported values are scaled down by 1,000.
+
+In principle, we could add special rules for two remaining patterns: “dead” funds that suddenly revive after 2023 (E.g. CIK 0001727599), and pre‑2023 filers that quietly start reporting in dollars without a clean spike (E.g. CIK 0001544204). Handling these well would require a more complex multi‑episode state model (with switch‑on/switch‑off logic and extra heuristics), which I judge out of proportion to their impact. Instead, we accept that some of these edge cases may remain imperfectly classified and rely on the simple one‑switch rule plus the 100‑billion fallback to catch the most economically important mis‑scaled portfolios.
 
 ```{r}
-detect_unit_switches <- function(holdext_raw) {
-  conversion_date <- ymd(20230103)
+# Heuristic calibration for unit-switch detection (not used downstream)
+calibration_panel <- build_holdext_raw() %>%
+  clean_dates() %>%
+  select_canonical_filings() %>%
+  clean_cusip() %>%
+  filter_outliers() %>%
+  to_duckdb() %>%
+  group_by(cik, rquarter) %>%
+  summarise(
+    portfolio_value = sum(value, na.rm = TRUE),
+    holdings_count  = n(),
+    .groups         = "drop"
+  ) %>%
+  collect() %>%
+  arrange(cik, rquarter) %>%
+  group_by(cik) %>%
+  mutate(
+    lag_value    = lag(portfolio_value),
+    lag_holdings = lag(holdings_count),
+    value_ratio = if_else(
+      !is.na(lag_value) & lag_value > 0,
+      portfolio_value / lag_value,
+      NA_real_
+    ),
+    holdings_ratio = if_else(
+      !is.na(lag_holdings) & lag_holdings > 0,
+      holdings_count / lag_holdings,
+      NA_real_
+    )
+  ) %>%
+  ungroup()
 
-  # 1. Create manager–quarter value panel
-  value_panel <- holdext_raw %>% 
-    to_duckdb() %>% 
-    group_by(cik, rquarter) %>% 
+ratio_summaries <- calibration_panel %>%
+  summarise(
+    n_obs                = sum(!is.na(value_ratio)),
+    p_value_gt_10        = mean(value_ratio > 10, na.rm = TRUE),
+    p_value_gt_50        = mean(value_ratio > 50, na.rm = TRUE),
+    p_holdings_gt_3      = mean(holdings_ratio > 3, na.rm = TRUE),
+    p_holdings_gt_5      = mean(holdings_ratio > 5, na.rm = TRUE),
+    p_spike_candidate    = mean(value_ratio > 50 & holdings_ratio < 5, na.rm = TRUE)
+  )
+ratio_summaries
+```
+```{r}
+detect_unit_switches <- function(holdext_raw) {
+  conversion_date     <- ymd("2023-01-03")
+  conversion_rquarter <- floor_date(conversion_date, "quarter") + months(3) - days(1)
+
+  # 1. Manager–quarter panel with simple ratios
+  value_panel <- holdext_raw %>%
+    to_duckdb() %>%
+    group_by(cik, rquarter) %>%
     summarise(
       fdate           = max(fdate, na.rm = TRUE),
       portfolio_value = sum(value,  na.rm = TRUE),
       holdings_count  = n(),
-      total_shares    = sum(shares, na.rm = TRUE),
       .groups         = "drop"
-    ) %>% 
-    collect() %>% 
-    arrange(cik, rquarter) %>% 
-    group_by(cik) %>% 
+    ) %>%
+    collect() %>%
+    arrange(cik, rquarter) %>%
+    group_by(cik) %>%
     mutate(
-      lag_value          = lag(portfolio_value),
-      lag_holdings_count = lag(holdings_count),
-      lag_total_shares   = lag(total_shares),
+      first_rquarter = min(rquarter, na.rm = TRUE),
+      first_fdate    = min(fdate,    na.rm = TRUE),
 
-      value_qoq_ratio = if_else(
-        portfolio_value > 0 & lag_value > 0,
+      # Use first_fdate, not rquarter
+      initial_state  = if_else(first_fdate < conversion_date, 0L, 1L),
+
+      lag_value    = lag(portfolio_value),
+      lag_holdings = lag(holdings_count),
+
+      value_ratio = if_else(
+        !is.na(lag_value) & lag_value > 0,
         portfolio_value / lag_value,
         NA_real_
       ),
-      holdings_qoq_ratio = if_else(
-        holdings_count > 0 & lag_holdings_count > 0,
-        holdings_count / lag_holdings_count,
+      holdings_ratio = if_else(
+        !is.na(lag_holdings) & lag_holdings > 0,
+        holdings_count / lag_holdings,
         NA_real_
-      ),
-      shares_qoq_ratio = if_else(
-        total_shares > 0 & lag_total_shares > 0,
-        total_shares / lag_total_shares,
-        NA_real_
-      ),
-      lead_value_qoq_ratio = lead(value_qoq_ratio),
-      min_rquarter_per_cik = min(rquarter, na.rm = TRUE)
-    ) %>% 
+      )
+    ) %>%
     ungroup()
 
-  # 2. Calibrate thresholds using pre‑2023 data
-  # Start with very loose provisional mins so we can measure the distribution
-  qoq_pre2023_raw <- value_panel %>%
-    filter(fdate < conversion_date)
-
-  # Helper for levels
-  calibrate_level <- function(df, var) {
-    df %>%
-      transmute(x = {{ var }}) %>%
-      filter(!is.na(x), is.finite(x), x > 0) %>%
-      summarise(
-        p01  = quantile(x, 0.01,  na.rm = TRUE),
-        p05  = quantile(x, 0.05,  na.rm = TRUE),
-        p10  = quantile(x, 0.10,  na.rm = TRUE),
-        med  = median(x, na.rm = TRUE),
-        .groups = "drop"
-      )
-  }
-
-  level_value_calibration    <- calibrate_level(qoq_pre2023_raw, portfolio_value)
-  level_holdings_calibration <- calibrate_level(qoq_pre2023_raw, holdings_count)
-
-  # Data‑driven minimums: e.g. 1st percentile for value and 5th percentile for holdings
-  min_portfolio_value <- as.numeric(level_value_calibration$p01)
-  min_holdings_count  <- as.numeric(level_holdings_calibration$p05)
-
-  # Now filter using these calibrated mins
-  qoq_pre2023 <- value_panel %>%
+  # 2. For each CIK, pick the biggest spike with sane holdings
+  switch_events <- value_panel %>%
+    group_by(cik) %>%
     filter(
-      fdate < conversion_date,
-      portfolio_value    >= min_portfolio_value,
-      lag_value          >= min_portfolio_value,
-      holdings_count     >= min_holdings_count,
-      lag_holdings_count >= min_holdings_count
-    )
-
-  # Ratio calibration helper (unchanged)
-  calibrate_ratio <- function(df, var) {
-    df %>%
-      transmute(x = {{ var }}) %>%
-      filter(!is.na(x), is.finite(x), x > 0) %>%
-      summarise(
-        p99   = quantile(x, 0.99,  na.rm = TRUE),
-        p995  = quantile(x, 0.995, na.rm = TRUE),
-        p999  = quantile(x, 0.999, na.rm = TRUE),
-        max_x = max(x, na.rm = TRUE),
-        .groups = "drop"
-      )
-  }
-
-  value_calibration    <- calibrate_ratio(qoq_pre2023, value_qoq_ratio)
-  holdings_calibration <- calibrate_ratio(qoq_pre2023, holdings_qoq_ratio)
-  shares_calibration   <- calibrate_ratio(qoq_pre2023, shares_qoq_ratio)
-
-  # Threshold for unit_conversions
-  jump_on_threshold  <- min(250, value_calibration$p995)
-  jump_off_threshold <- 1 / jump_on_threshold
-
-  # Post‑jump stabilisation (value ratios)
-  stable_lower <- 0.67
-  stable_upper <- 1.50
-
-  # Holdings and shares jump thresholds (ratio caps, data‑driven)
-  holdings_jump_upper <- min(5, holdings_calibration$p999)
-  shares_jump_upper   <- min(10, shares_calibration$p99 * 2)
-
-  # 3. Detect likely switch episodes
-  value_flags <- value_panel %>% 
-    filter(fdate >= conversion_date) %>% 
-    arrange(cik, rquarter) %>% 
-    group_by(cik) %>% 
+      !is.na(value_ratio),
+      is.na(holdings_ratio) | holdings_ratio < 5
+    ) %>%
+    slice_max(value_ratio, n = 1, with_ties = FALSE) %>%
     mutate(
-      has_preconversion_data = min_rquarter_per_cik < conversion_date,
+      switch_on_event = value_ratio > 50
+    ) %>%
+    select(cik, rquarter, switch_on_event)
 
-      eligible_for_detection =
-        portfolio_value    >= min_portfolio_value &
-        lag_value          >= min_portfolio_value &
-        holdings_count     >= min_holdings_count &
-        lag_holdings_count >= min_holdings_count,
+  # 3. Build unit_state over time
+  value_flags <- value_panel %>%
+    left_join(switch_events, by = c("cik", "rquarter")) %>%
+    group_by(cik) %>%
+    mutate(
+      switch_on_event = coalesce(switch_on_event, FALSE),
+      event           = if_else(switch_on_event, 1L, 0L),
+      unit_state      = initial_state + cumsum(event),
+      unit_state      = as.integer(pmax(0, pmin(1, unit_state))),
+      scale_down_flag = unit_state == 1L | cumsum(portfolio_value >= 1e8) > 0
+    ) %>%
+    ungroup() %>%
+    select(cik, rquarter, value_ratio, holdings_ratio, scale_down_flag)
 
-      stable_next_qtr =
-        !is.na(lead_value_qoq_ratio) &
-        dplyr::between(lead_value_qoq_ratio, stable_lower, stable_upper),
-
-      holdings_stable =
-        !is.na(holdings_qoq_ratio) &
-        holdings_qoq_ratio <= holdings_jump_upper,
-
-      shares_stable =
-        !is.na(shares_qoq_ratio) &
-        shares_qoq_ratio <= shares_jump_upper,
-
-      switch_on_event =
-        !is.na(value_qoq_ratio) &
-        eligible_for_detection &
-        holdings_stable &
-        shares_stable &
-        value_qoq_ratio >= jump_on_threshold &
-        stable_next_qtr,
-
-      switch_off_event =
-        !is.na(value_qoq_ratio) &
-        eligible_for_detection &
-        holdings_stable &
-        shares_stable &
-        value_qoq_ratio <= jump_off_threshold,
-
-      event          = dplyr::case_when(
-        switch_on_event  ~ 1L,
-        switch_off_event ~ -1L,
-        TRUE             ~ 0L
-      ),
-      raw_episode     = cumsum(event),
-      active_episode  = pmax(raw_episode, 0L),
-      # Apply scaling: detected switch OR post-conversion-only fund
-      scale_down_flag = active_episode > 0 | !has_preconversion_data
-    ) %>% 
-    ungroup()
-
-  # 4. Apply scaling to full row‑level data
-  holdext_raw %>% 
-    left_join(
-      value_flags %>% 
-        select(cik, rquarter, scale_down_flag),
-      by = c("cik", "rquarter"),
-      copy = TRUE
-    ) %>% 
+  # 4. Apply scaling back to row level
+  holdext_raw %>%
+    left_join(value_flags, by = c("cik", "rquarter"), copy = TRUE) %>%
     mutate(
       scale_down_flag = if_else(is.na(scale_down_flag), FALSE, scale_down_flag),
-      value = if_else(scale_down_flag, value / 1000, value)
+      value           = if_else(scale_down_flag, value / 1000, value)
     ) %>%
     select(
       filename, cik, cikname, rdate, rquarter, fdate,
